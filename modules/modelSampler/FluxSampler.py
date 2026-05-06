@@ -114,7 +114,7 @@ class FluxSampler(BaseModelSampler):
             text_ids = torch.zeros(prompt_embedding.shape[1], 3, device=self.train_device)
 
             self.model.transformer_to(self.train_device)
-            for i, timestep in enumerate(tqdm(timesteps, desc="sampling")):
+            for i, timestep in enumerate(tqdm(timesteps, **self.tqdm_kw())):
                 latent_model_input = torch.cat([latent_image])
                 expanded_timestep = timestep.expand(latent_model_input.shape[0])
 
@@ -336,7 +336,7 @@ class FluxSampler(BaseModelSampler):
             text_ids = torch.zeros(prompt_embedding.shape[1], 3, device=self.train_device)
 
             self.model.transformer_to(self.train_device)
-            for i, timestep in enumerate(tqdm(timesteps, desc="sampling")):
+            for i, timestep in enumerate(tqdm(timesteps, **self.tqdm_kw())):
                 latent_model_input = torch.cat([latent_image])
                 latent_model_input = torch.concat(
                     [latent_model_input, latent_conditioning_image, latent_mask], -1

@@ -110,7 +110,7 @@ class QwenSampler(BaseModelSampler):
                 text_attention_mask = None
 
             self.model.transformer_to(self.train_device)
-            for i, timestep in enumerate(tqdm(timesteps, desc="sampling")):
+            for i, timestep in enumerate(tqdm(timesteps, **self.tqdm_kw())):
                 latent_model_input = torch.cat([latent_image] * batch_size)
                 expanded_timestep = timestep.expand(batch_size)
                 noise_pred = transformer(

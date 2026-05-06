@@ -39,6 +39,7 @@ from modules.util.enum.ImageFormat import ImageFormat
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.PathIOType import PathIOType
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.memory_util import get_process_memory_snapshot, trim_process_working_set_windows
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 from modules.util.ui import components
@@ -292,55 +293,68 @@ class TrainUI(ctk.CTk):
                          tooltip="Port to use for Tensorboard link")
         components.entry(frame, 7, 3, self.ui_state, "tensorboard_port")
 
+        # RAM trim after training (Windows)
+        components.label(
+            frame,
+            8,
+            0,
+            "Trim RAM After Training",
+            tooltip="Windows: attempt to reduce Task Manager RAM usage after training ends. May slightly slow immediate restarts.",
+        )
+        components.switch(frame, 8, 1, self.ui_state, "trim_ram_after_training")
 
         # validation
-        components.label(frame, 8, 0, "Validation",
+        components.label(frame, 9, 0, "Validation",
                          tooltip="Enable validation steps and add new graph in tensorboard")
-        components.switch(frame, 8, 1, self.ui_state, "validation")
+        components.switch(frame, 9, 1, self.ui_state, "validation")
 
-        components.label(frame, 8, 2, "Validate after",
+        components.label(frame, 9, 2, "Validate after",
                          tooltip="The interval used when validate training")
-        components.time_entry(frame, 8, 3, self.ui_state, "validate_after", "validate_after_unit")
+        components.time_entry(frame, 9, 3, self.ui_state, "validate_after", "validate_after_unit")
 
         # device
-        components.label(frame, 10, 0, "Dataloader Threads",
+        components.label(frame, 11, 0, "Dataloader Threads",
                          tooltip="Number of threads used for the data loader. Increase if your GPU has room during caching, decrease if it's going out of memory during caching.")
-        components.entry(frame, 10, 1, self.ui_state, "dataloader_threads", required=True)
+        components.entry(frame, 11, 1, self.ui_state, "dataloader_threads", required=True)
 
-        components.label(frame, 11, 0, "Train Device",
+        components.label(frame, 12, 0, "Train Device",
                          tooltip="The device used for training. Can be \"cuda\", \"cuda:0\", \"cuda:1\" etc. Default:\"cuda\". Must be \"cuda\" for multi-GPU training.")
-        components.entry(frame, 11, 1, self.ui_state, "train_device", required=True)
+        components.entry(frame, 12, 1, self.ui_state, "train_device", required=True)
 
-        components.label(frame, 12, 0, "Multi-GPU",
+        components.label(frame, 13, 0, "Multi-GPU",
                          tooltip="Enable multi-GPU training")
-        components.switch(frame, 12, 1, self.ui_state, "multi_gpu")
-        components.label(frame, 12, 2, "Device Indexes",
+        components.switch(frame, 13, 1, self.ui_state, "multi_gpu")
+        components.label(frame, 13, 2, "Device Indexes",
                          tooltip="Multi-GPU: A comma-separated list of device indexes. If empty, all your GPUs are used. With a list such as \"0,1,3,4\" you can omit a GPU, for example an on-board graphics GPU.")
-        components.entry(frame, 12, 3, self.ui_state, "device_indexes")
+        components.entry(frame, 13, 3, self.ui_state, "device_indexes")
 
-        components.label(frame, 13, 0, "Gradient Reduce Precision",
+        components.label(frame, 14, 0, "Sampling Device Indexes",
+                         tooltip="Extra GPUs that participate in sampling while training on a single GPU. Comma-separated CUDA indexes (e.g. \"1,2\"). The train device GPU is always included. Leave empty to disable multi-GPU sampling.")
+        components.entry(frame, 14, 1, self.ui_state, "sample_device_indexes")
+
+        components.label(frame, 15, 0, "Gradient Reduce Precision",
                          tooltip="WEIGHT_DTYPE: Reduce gradients between GPUs in your weight data type; can be imprecise, but more efficient than float32\n"
                                  "WEIGHT_DTYPE_STOCHASTIC: Sum up the gradients in your weight data type, but average them in float32 and stochastically round if your weight data type is bfloat16\n"
                                  "FLOAT_32: Reduce gradients in float32\n"
                                  "FLOAT_32_STOCHASTIC: Reduce gradients in float32; use stochastic rounding to bfloat16 if your weight data type is bfloat16",
                          wide_tooltip=True)
-        components.options(frame, 13, 1, [str(x) for x in list(GradientReducePrecision)], self.ui_state,
+        components.options(frame, 15, 1, [str(x) for x in list(GradientReducePrecision)], self.ui_state,
                            "gradient_reduce_precision")
 
-        components.label(frame, 13, 2, "Fused Gradient Reduce",
+        components.label(frame, 15, 2, "Fused Gradient Reduce",
                          tooltip="Multi-GPU: Gradient synchronisation during the backward pass. Can be more efficient, especially with Async Gradient Reduce")
-        components.switch(frame, 13, 3, self.ui_state, "fused_gradient_reduce")
+        components.switch(frame, 15, 3, self.ui_state, "fused_gradient_reduce")
 
-        components.label(frame, 14, 0, "Async Gradient Reduce",
+        components.label(frame, 16, 0, "Async Gradient Reduce",
                          tooltip="Multi-GPU: Asynchroniously start the gradient reduce operations during the backward pass. Can be more efficient, but requires some VRAM.")
-        components.switch(frame, 14, 1, self.ui_state, "async_gradient_reduce")
-        components.label(frame, 14, 2, "Buffer size (MB)",
+        components.switch(frame, 16, 1, self.ui_state, "async_gradient_reduce")
+        components.label(frame, 16, 2, "Buffer size (MB)",
                          tooltip="Multi-GPU: Maximum VRAM for \"Async Gradient Reduce\", in megabytes. A multiple of this value can be needed if combined with \"Fused Back Pass\" and/or \"Layer offload fraction\"")
-        components.entry(frame, 14, 3, self.ui_state, "async_gradient_reduce_buffer")
+        components.entry(frame, 16, 3, self.ui_state, "async_gradient_reduce_buffer")
 
-        components.label(frame, 15, 0, "Temp Device",
+        components.label(frame, 17, 0, "Temp Device",
                          tooltip="The device used to temporarily offload models while they are not used. Default:\"cpu\"")
-        components.entry(frame, 15, 1, self.ui_state, "temp_device")
+        components.entry(frame, 17, 1, self.ui_state, "temp_device")
 
         frame.pack(fill="both", expand=1)
         return frame
@@ -762,6 +776,10 @@ class TrainUI(ctk.CTk):
 
         trainer = create.create_trainer(self.train_config, self.training_callbacks, self.training_commands, reattach=self.cloud_tab.reattach)
         try:
+            print(f"[memory] before start: {get_process_memory_snapshot().to_log_dict()}")
+        except Exception:
+            pass
+        try:
             trainer.start()
             if self.train_config.cloud.enabled:
                 self.ui_state.get_var("secrets.cloud").update(self.train_config.secrets.cloud)
@@ -774,6 +792,10 @@ class TrainUI(ctk.CTk):
             error_caught = True
             traceback.print_exc()
 
+        try:
+            print(f"[memory] before end: {get_process_memory_snapshot().to_log_dict()}")
+        except Exception:
+            pass
         trainer.end()
 
         # clear gpu memory
@@ -783,6 +805,19 @@ class TrainUI(ctk.CTk):
         self.training_commands = None
         torch.clear_autocast_cache()
         torch_gc()
+
+        try:
+            print(f"[memory] after torch_gc: {get_process_memory_snapshot().to_log_dict()}")
+        except Exception:
+            pass
+
+        if getattr(self.train_config, "trim_ram_after_training", False):
+            try:
+                ok = trim_process_working_set_windows()
+                print(f"[memory] working_set_trim_ok={ok}")
+                print(f"[memory] after trim: {get_process_memory_snapshot().to_log_dict()}")
+            except Exception:
+                pass
 
         if error_caught:
             self.on_update_status("Error: check the console for details")

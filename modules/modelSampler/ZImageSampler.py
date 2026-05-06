@@ -114,7 +114,7 @@ class ZImageSampler(BaseModelSampler):
                 active_transformer = meancache
                 logger.info(f"[MeanCache] Enabled with preset: {meancache_preset}")
             
-            for i, timestep in enumerate(tqdm(timesteps, desc="sampling")):
+            for i, timestep in enumerate(tqdm(timesteps, **self.tqdm_kw())):
                 latent_model_input = latent_image.unsqueeze(2).to(dtype=self.model.train_dtype.torch_dtype())
                 latent_model_input = torch.cat([latent_model_input] * batch_size)
                 latent_model_input_list = list(latent_model_input.unbind(dim=0))

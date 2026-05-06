@@ -141,7 +141,7 @@ class StableDiffusionXLSampler(BaseModelSampler):
 
             # denoising loop
             self.model.unet_to(self.train_device)
-            for i, timestep in enumerate(tqdm(timesteps, desc="sampling")):
+            for i, timestep in enumerate(tqdm(timesteps, **self.tqdm_kw())):
                 latent_model_input = torch.cat([latent_image] * 2)
                 latent_model_input = noise_scheduler.scale_model_input(latent_model_input, timestep)
 
@@ -179,7 +179,8 @@ class StableDiffusionXLSampler(BaseModelSampler):
             # decode
             self.model.vae_to(self.train_device)
 
-            latent_image = latent_image.to(dtype=self.model.vae_train_dtype.torch_dtype())
+            vae_dtype = next(vae.parameters()).dtype
+            latent_image = latent_image.to(dtype=vae_dtype)
             with self.model.vae_autocast_context:
                 image = vae.decode(latent_image / vae.config.scaling_factor, return_dict=False)[0]
 
@@ -386,7 +387,7 @@ class StableDiffusionXLSampler(BaseModelSampler):
 
             # denoising loop
             self.model.unet_to(self.train_device)
-            for i, timestep in enumerate(tqdm(timesteps, desc="sampling")):
+            for i, timestep in enumerate(tqdm(timesteps, **self.tqdm_kw())):
                 latent_model_input = noise_scheduler.scale_model_input(latent_image, timestep)
                 latent_model_input = torch.concat(
                     [latent_model_input, latent_mask, latent_conditioning_image], 1
@@ -427,7 +428,8 @@ class StableDiffusionXLSampler(BaseModelSampler):
             # decode
             self.model.vae_to(self.train_device)
 
-            latent_image = latent_image.to(dtype=self.model.vae_train_dtype.torch_dtype())
+            vae_dtype = next(vae.parameters()).dtype
+            latent_image = latent_image.to(dtype=vae_dtype)
             with self.model.vae_autocast_context:
                 image = vae.decode(latent_image / vae.config.scaling_factor, return_dict=False)[0]
 

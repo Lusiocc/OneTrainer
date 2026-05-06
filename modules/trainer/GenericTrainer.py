@@ -4,6 +4,7 @@ import json
 import math
 import os
 import shutil
+import threading
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -13,6 +14,7 @@ from modules.dataLoader.BaseDataLoader import BaseDataLoader
 from modules.model.BaseModel import BaseModel
 from modules.modelLoader.BaseModelLoader import BaseModelLoader
 from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
+from modules.modelSampler.SamplerPool import SamplerJob, SamplerPool
 from modules.modelSaver.BaseModelSaver import BaseModelSaver
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.trainer.BaseTrainer import BaseTrainer
@@ -31,7 +33,6 @@ from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util import dop_util
 from modules.util.profiling_util import TorchMemoryRecorder, TorchProfiler
-from modules.util.sampler_only_lora import SamplerOnlyLoRABatchManager, build_sampler_lora_reuse_key
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
@@ -79,6 +80,7 @@ class GenericTrainer(BaseTrainer):
         self.model = None
         self.one_step_trained = False
         self.grad_hook_handles = []
+        self.sampler_pool: SamplerPool | None = None
 
     def start(self):
         if multi.is_master():
@@ -154,6 +156,14 @@ class GenericTrainer(BaseTrainer):
         self.model_saver = self.create_model_saver()
 
         self.model_sampler = self.create_model_sampler(self.model)
+        self.sampler_pool = SamplerPool(
+            self.config,
+            self.train_device,
+            self.temp_device,
+            self.model,
+            self.model_sampler,
+            self.model_loader,
+        )
         self.previous_sample_time = -1
         self.sample_queue = []
 
@@ -245,12 +255,40 @@ class GenericTrainer(BaseTrainer):
             folder_postfix: str = "",
             is_custom_sample: bool = False,
     ):
-        sampler_lora_batch_manager = SamplerOnlyLoRABatchManager()
+        enabled_list = [sc for sc in sample_config_list if sc.enabled]
+        samples_run = list(
+            multi.distributed_enumerate(
+                enabled_list,
+                distribute=not self.config.samples_to_tensorboard and not ema_applied,
+            )
+        )
+        total_jobs = len(samples_run)
+        completed_cnt = [0]
+        sample_cb_lock = threading.Lock()
+
+        self.model.to(self.temp_device)
+        self.model.eval()
+        if self.sampler_pool is not None:
+            self.sampler_pool.sync_weights_from(self.model)
+
+        if total_jobs > 0:
+            with sample_cb_lock:
+                if is_custom_sample:
+                    self.callbacks.on_update_sample_custom_progress(0, total_jobs)
+                else:
+                    self.callbacks.on_update_sample_default_progress(0, total_jobs)
+
+        def bump_progress() -> None:
+            with sample_cb_lock:
+                completed_cnt[0] += 1
+                n = completed_cnt[0]
+                if is_custom_sample:
+                    self.callbacks.on_update_sample_custom_progress(n, total_jobs)
+                else:
+                    self.callbacks.on_update_sample_default_progress(n, total_jobs)
+
         try:
-            for i, sample_config in multi.distributed_enumerate(
-                [sample_config for sample_config in sample_config_list if sample_config.enabled],
-                distribute=not self.config.samples_to_tensorboard and not ema_applied
-            ):
+            for i, sample_config in samples_run:
                 try:
                     safe_prompt = path_util.safe_filename(sample_config.prompt)
 
@@ -272,55 +310,44 @@ class GenericTrainer(BaseTrainer):
                         f"{self.config.save_filename_prefix}{get_string_timestamp()}-training-sample-{train_progress.filename_string()}"
                     )
 
-                    def on_sample_default(sampler_output: ModelSamplerOutput):
-                        if self.config.samples_to_tensorboard and sampler_output.file_type == FileType.IMAGE:
-                            self.tensorboard.add_image(
-                                f"sample{str(i)} - {safe_prompt}", pil_to_tensor(sampler_output.data),  # noqa: B023
-                                train_progress.global_step
-                            )
-                        self.callbacks.on_sample_default(sampler_output)
+                    def on_sample_default(sampler_output: ModelSamplerOutput, *, _i=i, _prompt=safe_prompt):
+                        with sample_cb_lock:
+                            if self.config.samples_to_tensorboard and sampler_output.file_type == FileType.IMAGE:
+                                self.tensorboard.add_image(
+                                    f"sample{str(_i)} - {_prompt}",
+                                    pil_to_tensor(sampler_output.data),
+                                    train_progress.global_step,
+                                )
+                            self.callbacks.on_sample_default(sampler_output)
 
                     def on_sample_custom(sampler_output: ModelSamplerOutput):
-                        self.callbacks.on_sample_custom(sampler_output)
+                        with sample_cb_lock:
+                            self.callbacks.on_sample_custom(sampler_output)
 
                     on_sample = on_sample_custom if is_custom_sample else on_sample_default
-                    on_update_progress = self.callbacks.on_update_sample_custom_progress if is_custom_sample else self.callbacks.on_update_sample_default_progress
 
-                    self.model.to(self.temp_device)
-                    self.model.eval()
+                    sample_config_c = copy.copy(sample_config)
+                    sample_config_c.from_train_config(self.config)
 
-                    sample_config = copy.copy(sample_config)
-                    sample_config.from_train_config(self.config)
-                    reuse_key = build_sampler_lora_reuse_key(
-                        self.config,
-                        sample_config,
-                        train_device,
-                        batch_marker=f"ema:{str(ema_applied)}",
-                    )
-                    sampler_lora_batch_manager.acquire(
-                        self.model,
-                        self.config,
-                        sample_config,
-                        train_device,
-                        batch_key=reuse_key,
-                    )
-
-                    self.model_sampler.sample(
-                        sample_config=sample_config,
+                    job = SamplerJob(
+                        index=i,
+                        sample_config=sample_config_c,
                         destination=sample_path,
                         image_format=self.config.sample_image_format,
                         video_format=self.config.sample_video_format,
                         audio_format=self.config.sample_audio_format,
                         on_sample=on_sample,
-                        on_update_progress=on_update_progress,
+                        on_job_complete=bump_progress,
+                        batch_marker=f"ema:{str(ema_applied)}",
                     )
+                    self.sampler_pool.submit(job)
                 except Exception:
                     traceback.print_exc()
                     print("Error during sampling, proceeding without sampling")
 
-                torch_gc()
         finally:
-            sampler_lora_batch_manager.close()
+            self.sampler_pool.wait_all()
+            torch_gc()
 
     def __sample_during_training(
             self,
@@ -982,6 +1009,9 @@ class GenericTrainer(BaseTrainer):
                 return
 
     def end(self):
+        if self.sampler_pool is not None:
+            self.sampler_pool.shutdown()
+
         if self.one_step_trained:
             self.model.to(self.temp_device)
 

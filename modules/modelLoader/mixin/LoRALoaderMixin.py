@@ -53,10 +53,18 @@ class LoRALoaderMixin(metaclass=ABCMeta):
         if os.path.exists(os.path.join(lora_name, "meta.json")):
             safetensors_lora_name = os.path.join(lora_name, "lora", "lora.safetensors")
             if os.path.exists(safetensors_lora_name):
-                # Internal backups are already written in OneTrainer-native keyspace.
-                # Re-running external format conversion here can corrupt unknown/legacy
-                # keys and break resume loading for older checkpoints.
-                model.lora_state_dict = self.__repair_internal_keys(load_file(safetensors_lora_name))
+                repaired_state_dict = self.__repair_internal_keys(load_file(safetensors_lora_name))
+
+                # Internal backups are usually already in the loader's target keyspace,
+                # but older backups can still contain pre-conversion prefixes (e.g. "unet.").
+                # Convert when possible and merge results so unknown keys are preserved.
+                key_sets = self._get_convert_key_sets(model)
+                if key_sets is not None:
+                    converted_state_dict = convert_to_diffusers(repaired_state_dict, key_sets)
+                    if any(key not in repaired_state_dict for key in converted_state_dict):
+                        repaired_state_dict = repaired_state_dict | converted_state_dict
+
+                model.lora_state_dict = repaired_state_dict
         else:
             raise Exception("not an internal model")
 

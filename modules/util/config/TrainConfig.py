@@ -398,6 +398,7 @@ class TrainConfig(BaseConfig):
     tensorboard_expose: bool
     tensorboard_always_on: bool
     tensorboard_port: str
+    trim_ram_after_training: bool
     validation: bool
     validate_after: float
     validate_after_unit: TimeUnit
@@ -408,6 +409,7 @@ class TrainConfig(BaseConfig):
     # multi-GPU
     multi_gpu: bool
     device_indexes: str
+    sample_device_indexes: str
     gradient_reduce_prevision: GradientReducePrecision
     fused_gradient_reduce: bool
     async_gradient_reduce: bool
@@ -1021,6 +1023,7 @@ class TrainConfig(BaseConfig):
         data.append(("tensorboard_expose", False, bool, False))
         data.append(("tensorboard_always_on", False, bool, False))
         data.append(("tensorboard_port", 6006, int, False))
+        data.append(("trim_ram_after_training", True, bool, False))
         data.append(("validation", False, bool, False))
         data.append(("validate_after", 1, int, False))
         data.append(("validate_after_unit", TimeUnit.EPOCH, TimeUnit, False))
@@ -1031,6 +1034,7 @@ class TrainConfig(BaseConfig):
         #multi-GPU
         data.append(("multi_gpu", False, bool, False))
         data.append(("device_indexes", "", str, False))
+        data.append(("sample_device_indexes", "", str, False))
         data.append(("gradient_reduce_precision", GradientReducePrecision.FLOAT_32_STOCHASTIC, GradientReducePrecision, False))
         data.append(("fused_gradient_reduce", True, bool, False))
         data.append(("async_gradient_reduce", True, bool, False))

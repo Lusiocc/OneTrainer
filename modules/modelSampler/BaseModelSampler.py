@@ -1,5 +1,6 @@
 import io
 import os
+import threading
 from abc import ABCMeta, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
@@ -59,6 +60,17 @@ class BaseModelSampler(metaclass=ABCMeta):
 
         self.train_device = train_device
         self.temp_device = temp_device
+
+    def tqdm_kw(self, desc: str = "sampling") -> dict:
+        """Extra kwargs for tqdm when running inside `SamplerPool` worker threads."""
+        tls = threading.current_thread()
+        wi = getattr(tls, "_sampler_tqdm_worker_idx", None)
+        if wi is None:
+            return {"desc": desc}
+        di = getattr(tls, "_sampler_tqdm_device_index", None)
+        di_str = str(di) if di is not None else "?"
+        # Keep completed bars in logs to match previous sampling output behavior.
+        return {"position": int(wi), "leave": True, "desc": f"GPU{di_str} {desc}"}
 
     @abstractmethod
     def sample(

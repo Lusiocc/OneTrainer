@@ -2,6 +2,7 @@
 .idea
 .vscode/
 .agent/
+.cursor/
 local_changes.txt
 *.bak
 *.pyc
