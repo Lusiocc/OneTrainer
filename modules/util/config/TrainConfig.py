@@ -14,6 +14,7 @@ from modules.util.enum.CenteredWDMode import CenteredWDMode
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
 from modules.util.enum.CEPNoiseType import CEPNoiseType
+from modules.util.enum.DOPPolicy import DOPPolicy
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
 from modules.util.enum.GradientReducePrecision import GradientReducePrecision
@@ -121,10 +122,7 @@ class TrainOptimizerConfig(BaseConfig):
     beta1_warmup: int
     min_beta1: float
     Simplified_AdEMAMix: False
-    cautious_mask: False
-    grams_moment: False
     kourkoutas_beta: False
-    k_warmup_steps: int
     schedulefree_c: float
     ns_steps: int
     MuonWithAuxAdam: False
@@ -137,13 +135,11 @@ class TrainOptimizerConfig(BaseConfig):
     rms_rescaling: True
     normuon_variant: False
     beta2_normuon: float
-    normuon_eps: float
     low_rank_ortho: False
     ortho_rank: int
     accelerated_ns: False
     cautious_wd: False
     approx_mars: False
-    kappa_p: float
     auto_kappa_p: False
     compile: False
     allora: bool
@@ -254,10 +250,7 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("beta1_warmup", None, int, True))
         data.append(("min_beta1", None, float, True))
         data.append(("Simplified_AdEMAMix", False, bool, False))
-        data.append(("cautious_mask", False, bool, False))
-        data.append(("grams_moment", False, bool, False))
         data.append(("kourkoutas_beta", False, bool, False))
-        data.append(("k_warmup_steps", None, int, True))
         data.append(("schedulefree_c", None, float, True))
         data.append(("ns_steps", None, int, True))
         data.append(("MuonWithAuxAdam", False, bool, False))
@@ -270,13 +263,11 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("rms_rescaling", True, bool, True))
         data.append(("normuon_variant", False, bool, False))
         data.append(("beta2_normuon", None, float, True))
-        data.append(("normuon_eps", None, float, True))
         data.append(("low_rank_ortho", False, bool, False))
         data.append(("ortho_rank", None, int, True))
         data.append(("accelerated_ns", False, bool, False))
         data.append(("cautious_wd", False, bool, False))
         data.append(("approx_mars", False, bool, False))
-        data.append(("kappa_p", None, float, True))
         data.append(("auto_kappa_p", False, bool, False))
         data.append(("compile", False, bool, False))
         data.append(("allora", True, bool, False))
@@ -397,6 +388,7 @@ class TrainConfig(BaseConfig):
     tensorboard_expose: bool
     tensorboard_always_on: bool
     tensorboard_port: str
+    trim_ram_after_training: bool
     validation: bool
     validate_after: float
     validate_after_unit: TimeUnit
@@ -407,6 +399,7 @@ class TrainConfig(BaseConfig):
     # multi-GPU
     multi_gpu: bool
     device_indexes: str
+    sample_device_indexes: str
     gradient_reduce_prevision: GradientReducePrecision
     fused_gradient_reduce: bool
     async_gradient_reduce: bool
@@ -572,6 +565,28 @@ class TrainConfig(BaseConfig):
     lora_decompose_output_axis: bool
     lora_weight_dtype: DataType
     bundle_additional_embeddings: bool
+
+    # Sampler-only LoRA (e.g. DMD2 / Lightning); not optimized; stacked at sample time
+    sampler_lora_model_name: str
+    sampler_lora_strength: float
+    sampler_lora_rank: int | None
+
+    # Differential Output Preservation (DOP)
+    dop_enabled: bool
+    dop_multiplier: float
+    dop_trigger_token: str
+    dop_class_replacement: str
+    dop_preset: str
+    dop_policy: DOPPolicy
+    dop_interval_steps: int
+    dop_start_step: int
+    dop_end_step: int
+    dop_adaptive_strength: float
+    dop_word_boundary_only: bool
+    dop_case_sensitive: bool
+    dop_allow_missing_trigger: bool
+    # If > 0, weighted DOP loss is capped at (this * base_loss) per step so preservation cannot extinguish concept learning.
+    dop_max_weighted_to_base_ratio: float
 
     # lokr
     lokr_factor: int
@@ -967,7 +982,7 @@ class TrainConfig(BaseConfig):
             with open(config.sample_definition_file_name, 'r') as f:
                 samples = json.load(f)
                 for i in range(len(samples)):
-                    samples[i] = SampleConfig.default_values().from_dict(samples[i])
+                    samples[i] = SampleConfig.default_values(config.model_type).from_dict(samples[i])
                 config.samples = samples
 
         config_dict = config.to_dict()
@@ -998,6 +1013,7 @@ class TrainConfig(BaseConfig):
         data.append(("tensorboard_expose", False, bool, False))
         data.append(("tensorboard_always_on", False, bool, False))
         data.append(("tensorboard_port", 6006, int, False))
+        data.append(("trim_ram_after_training", True, bool, False))
         data.append(("validation", False, bool, False))
         data.append(("validate_after", 1, int, False))
         data.append(("validate_after_unit", TimeUnit.EPOCH, TimeUnit, False))
@@ -1008,6 +1024,7 @@ class TrainConfig(BaseConfig):
         #multi-GPU
         data.append(("multi_gpu", False, bool, False))
         data.append(("device_indexes", "", str, False))
+        data.append(("sample_device_indexes", "", str, False))
         data.append(("gradient_reduce_precision", GradientReducePrecision.FLOAT_32_STOCHASTIC, GradientReducePrecision, False))
         data.append(("fused_gradient_reduce", True, bool, False))
         data.append(("async_gradient_reduce", True, bool, False))
@@ -1216,7 +1233,25 @@ class TrainConfig(BaseConfig):
         data.append(("lora_decompose_output_axis", False, bool, False))
         data.append(("lora_weight_dtype", DataType.FLOAT_32, DataType, False))
         data.append(("bundle_additional_embeddings", True, bool, False))
-        
+
+        data.append(("sampler_lora_model_name", "", str, False))
+        data.append(("sampler_lora_strength", 1.0, float, False))
+        data.append(("sampler_lora_rank", None, int, True))
+        data.append(("dop_enabled", False, bool, False))
+        data.append(("dop_multiplier", 1.0, float, False))
+        data.append(("dop_trigger_token", "", str, False))
+        data.append(("dop_class_replacement", "", str, False))
+        data.append(("dop_preset", "balanced", str, False))
+        data.append(("dop_policy", DOPPolicy.ALWAYS_ON, DOPPolicy, False))
+        data.append(("dop_interval_steps", 10, int, False))
+        data.append(("dop_start_step", 0, int, False))
+        data.append(("dop_end_step", -1, int, False))
+        data.append(("dop_adaptive_strength", 1.0, float, False))
+        data.append(("dop_word_boundary_only", True, bool, False))
+        data.append(("dop_case_sensitive", False, bool, False))
+        data.append(("dop_allow_missing_trigger", False, bool, False))
+        data.append(("dop_max_weighted_to_base_ratio", 0.0, float, False))
+
         # lokr
         data.append(("lokr_factor", -1, int, False))
 

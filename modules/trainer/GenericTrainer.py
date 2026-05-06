@@ -4,6 +4,7 @@ import json
 import math
 import os
 import shutil
+import threading
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -13,6 +14,7 @@ from modules.dataLoader.BaseDataLoader import BaseDataLoader
 from modules.model.BaseModel import BaseModel
 from modules.modelLoader.BaseModelLoader import BaseModelLoader
 from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
+from modules.modelSampler.SamplerPool import SamplerJob, SamplerPool
 from modules.modelSaver.BaseModelSaver import BaseModelSaver
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.trainer.BaseTrainer import BaseTrainer
@@ -29,6 +31,7 @@ from modules.util.enum.FileType import FileType
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util import dop_util
 from modules.util.profiling_util import TorchMemoryRecorder, TorchProfiler
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
@@ -77,6 +80,7 @@ class GenericTrainer(BaseTrainer):
         self.model = None
         self.one_step_trained = False
         self.grad_hook_handles = []
+        self.sampler_pool: SamplerPool | None = None
 
     def start(self):
         if multi.is_master():
@@ -133,6 +137,7 @@ class GenericTrainer(BaseTrainer):
             quantization=self.config.quantization,
         )
         self.model.train_config = self.config
+        self.__validate_dop_config()
 
         self.callbacks.on_update_status("running model setup")
 
@@ -151,6 +156,14 @@ class GenericTrainer(BaseTrainer):
         self.model_saver = self.create_model_saver()
 
         self.model_sampler = self.create_model_sampler(self.model)
+        self.sampler_pool = SamplerPool(
+            self.config,
+            self.train_device,
+            self.temp_device,
+            self.model,
+            self.model_sampler,
+            self.model_loader,
+        )
         self.previous_sample_time = -1
         self.sample_queue = []
 
@@ -160,6 +173,34 @@ class GenericTrainer(BaseTrainer):
             self.validation_data_loader = self.create_data_loader(
                 self.model, self.model_setup, self.model.train_progress, is_validation=True
             )
+
+    def __validate_dop_config(self):
+        if not self.config.dop_enabled:
+            return
+        if self.config.training_method != TrainingMethod.LORA:
+            raise ValueError("Differential Output Preservation requires LoRA training mode.")
+        if not (self.config.dop_trigger_token or "").strip():
+            raise ValueError("Differential Output Preservation requires a non-empty trigger token.")
+        if not (self.config.dop_class_replacement or "").strip():
+            raise ValueError("Differential Output Preservation requires a non-empty class replacement.")
+        train_any_text_encoder = self.config.train_text_encoder_or_embedding()
+        if self.config.model_type.has_multiple_text_encoders():
+            train_any_text_encoder = train_any_text_encoder \
+                or self.config.train_text_encoder_2_or_embedding() \
+                or self.config.train_text_encoder_3_or_embedding() \
+                or self.config.train_text_encoder_4_or_embedding()
+        if train_any_text_encoder:
+            raise ValueError(
+                "Differential Output Preservation is not supported while training text encoders or text embeddings."
+            )
+        if self.config.dop_interval_steps < 1:
+            raise ValueError("Differential Output Preservation interval steps must be >= 1.")
+        if self.config.dop_end_step < -1:
+            raise ValueError("Differential Output Preservation end step must be -1 or >= 0.")
+        if self.config.dop_multiplier < 0:
+            raise ValueError("Differential Output Preservation multiplier must be >= 0.")
+        if self.config.dop_max_weighted_to_base_ratio < 0:
+            raise ValueError("Differential Output Preservation max weighted-to-base ratio must be >= 0.")
 
     def __save_config_to_workspace(self):
         path = path_util.canonical_join(self.config.workspace_dir, "config")
@@ -214,64 +255,101 @@ class GenericTrainer(BaseTrainer):
             folder_postfix: str = "",
             is_custom_sample: bool = False,
     ):
-        for i, sample_config in multi.distributed_enumerate(
-            [sample_config for sample_config in sample_config_list if sample_config.enabled],
-            distribute=not self.config.samples_to_tensorboard and not ema_applied
-        ):
-            try:
-                safe_prompt = path_util.safe_filename(sample_config.prompt)
+        enabled_list = [sc for sc in sample_config_list if sc.enabled]
+        samples_run = list(
+            multi.distributed_enumerate(
+                enabled_list,
+                distribute=not self.config.samples_to_tensorboard and not ema_applied,
+            )
+        )
+        total_jobs = len(samples_run)
+        completed_cnt = [0]
+        sample_cb_lock = threading.Lock()
 
+        self.model.to(self.temp_device)
+        self.model.eval()
+        if self.sampler_pool is not None:
+            self.sampler_pool.sync_weights_from(self.model)
+
+        if total_jobs > 0:
+            with sample_cb_lock:
                 if is_custom_sample:
-                    sample_dir = os.path.join(
-                        self.config.workspace_dir,
-                        "samples",
-                        "custom",
-                    )
+                    self.callbacks.on_update_sample_custom_progress(0, total_jobs)
                 else:
-                    sample_dir = os.path.join(
-                        self.config.workspace_dir,
-                        "samples",
-                        f"{str(i)} - {safe_prompt}{folder_postfix}",
+                    self.callbacks.on_update_sample_default_progress(0, total_jobs)
+
+        def bump_progress() -> None:
+            with sample_cb_lock:
+                completed_cnt[0] += 1
+                n = completed_cnt[0]
+                if is_custom_sample:
+                    self.callbacks.on_update_sample_custom_progress(n, total_jobs)
+                else:
+                    self.callbacks.on_update_sample_default_progress(n, total_jobs)
+
+        try:
+            for i, sample_config in multi.distributed(
+                    [(i, sample_config) for i, sample_config in enumerate(sample_config_list) if sample_config.enabled],
+                    distribute=not self.config.samples_to_tensorboard and not ema_applied
+            ):
+                try:
+                    safe_prompt = path_util.safe_filename(sample_config.prompt)
+
+                    if is_custom_sample:
+                        sample_dir = os.path.join(
+                            self.config.workspace_dir,
+                            "samples",
+                            "custom",
+                        )
+                    else:
+                        sample_dir = os.path.join(
+                            self.config.workspace_dir,
+                            "samples",
+                            f"{str(i)} - {safe_prompt}{folder_postfix}",
+                        )
+
+                    sample_path = os.path.join(
+                        sample_dir,
+                        f"{self.config.save_filename_prefix}{get_string_timestamp()}-training-sample-{train_progress.filename_string()}"
                     )
 
-                sample_path = os.path.join(
-                    sample_dir,
-                    f"{self.config.save_filename_prefix}{get_string_timestamp()}-training-sample-{train_progress.filename_string()}"
-                )
+                    def on_sample_default(sampler_output: ModelSamplerOutput, *, _i=i, _prompt=safe_prompt):
+                        with sample_cb_lock:
+                            if self.config.samples_to_tensorboard and sampler_output.file_type == FileType.IMAGE:
+                                self.tensorboard.add_image(
+                                    f"sample{str(_i)} - {_prompt}",
+                                    pil_to_tensor(sampler_output.data),
+                                    train_progress.global_step,
+                                )
+                            self.callbacks.on_sample_default(sampler_output)
 
-                def on_sample_default(sampler_output: ModelSamplerOutput):
-                    if self.config.samples_to_tensorboard and sampler_output.file_type == FileType.IMAGE:
-                        self.tensorboard.add_image(
-                            f"sample{str(i)} - {safe_prompt}", pil_to_tensor(sampler_output.data),  # noqa: B023
-                            train_progress.global_step
-                        )
-                    self.callbacks.on_sample_default(sampler_output)
+                    def on_sample_custom(sampler_output: ModelSamplerOutput):
+                        with sample_cb_lock:
+                            self.callbacks.on_sample_custom(sampler_output)
 
-                def on_sample_custom(sampler_output: ModelSamplerOutput):
-                    self.callbacks.on_sample_custom(sampler_output)
+                    on_sample = on_sample_custom if is_custom_sample else on_sample_default
 
-                on_sample = on_sample_custom if is_custom_sample else on_sample_default
-                on_update_progress = self.callbacks.on_update_sample_custom_progress if is_custom_sample else self.callbacks.on_update_sample_default_progress
+                    sample_config_c = copy.copy(sample_config)
+                    sample_config_c.from_train_config(self.config)
 
-                self.model.to(self.temp_device)
-                self.model.eval()
+                    job = SamplerJob(
+                        index=i,
+                        sample_config=sample_config_c,
+                        destination=sample_path,
+                        image_format=self.config.sample_image_format,
+                        video_format=self.config.sample_video_format,
+                        audio_format=self.config.sample_audio_format,
+                        on_sample=on_sample,
+                        on_job_complete=bump_progress,
+                        batch_marker=f"ema:{str(ema_applied)}",
+                    )
+                    self.sampler_pool.submit(job)
+                except Exception:
+                    traceback.print_exc()
+                    print("Error during sampling, proceeding without sampling")
 
-                sample_config = copy.copy(sample_config)
-                sample_config.from_train_config(self.config)
-
-                self.model_sampler.sample(
-                    sample_config=sample_config,
-                    destination=sample_path,
-                    image_format=self.config.sample_image_format,
-                    video_format=self.config.sample_video_format,
-                    audio_format=self.config.sample_audio_format,
-                    on_sample=on_sample,
-                    on_update_progress=on_update_progress,
-                )
-            except Exception:
-                traceback.print_exc()
-                print("Error during sampling, proceeding without sampling")
-
+        finally:
+            self.sampler_pool.wait_all()
             torch_gc()
 
     def __sample_during_training(
@@ -298,7 +376,7 @@ class GenericTrainer(BaseTrainer):
                 with open(self.config.sample_definition_file_name, 'r') as f:
                     samples = json.load(f)
                     for i in range(len(samples)):
-                        samples[i] = SampleConfig.default_values().from_dict(samples[i])
+                        samples[i] = SampleConfig.default_values(self.config.model_type).from_dict(samples[i])
                     sample_params_list = samples
             # We absolutely do not want to fail training just because the sample definition file becomes missing or broken right before sampling.
             except Exception:
@@ -630,11 +708,18 @@ class GenericTrainer(BaseTrainer):
 
         lr_scheduler = None
         accumulated_loss = torch.tensor(0.0, device=train_device)
+        accumulated_base_loss = torch.tensor(0.0, device=train_device)
+        accumulated_dop_loss = torch.tensor(0.0, device=train_device)
+        accumulated_dop_weighted_loss = torch.tensor(0.0, device=train_device)
+        accumulated_dop_trigger_replaced = torch.tensor(0.0, device=train_device)
         ema_loss = None
         ema_loss_steps = 0
         epochs = range(train_progress.epoch, self.config.epochs, 1)
 
         for _epoch in tqdm(epochs, desc="epoch") if multi.is_master() else epochs:
+            multi.sync_commands(self.commands)
+            if self.commands.get_stop_command():
+                return
             self.callbacks.on_update_status("Starting epoch/caching")
 
             #call start_next_epoch with only one process at first, because it might write to the cache. All subsequent processes can read in parallel:
@@ -685,7 +770,7 @@ class GenericTrainer(BaseTrainer):
                 if self.commands.get_stop_command():
                     multi.warn_parameter_divergence(self.parameters, train_device)
 
-                if self.__needs_sample(train_progress) or self.commands.get_and_reset_sample_default_command():
+                if not self.commands.get_stop_command() and self.__needs_sample(train_progress) or self.commands.get_and_reset_sample_default_command():
                     self.__enqueue_sample_during_training(
                         lambda: self.__sample_during_training(train_progress, train_device)
                     )
@@ -722,7 +807,10 @@ class GenericTrainer(BaseTrainer):
 
                 self.callbacks.on_update_status("Training ...")
 
-                with TorchMemoryRecorder(enabled=False), TorchProfiler(enabled=False, filename=f"step{train_progress.global_step}.json"):
+                with (
+                    TorchMemoryRecorder(enabled=False, filename=f"memory-step{train_progress.global_step}.pickle"),
+                    TorchProfiler      (enabled=False, filename=f"profile-step{train_progress.global_step}.json"),
+                ):
                     step_seed = train_progress.global_step
                     bf16_stochastic_rounding_set_seed(step_seed, train_device)
 
@@ -743,7 +831,40 @@ class GenericTrainer(BaseTrainer):
                     else:
                         model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
-                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
+                    base_loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
+                    dop_loss = torch.tensor(0.0, device=train_device)
+                    dop_weighted_loss = torch.tensor(0.0, device=train_device)
+
+                    run_dop = dop_util.should_run_dop(self.config, train_progress.global_step)
+                    dop_batch = None
+                    if run_dop:
+                        dop_batch = dop_util.create_prompt_replaced_batch(self.model, batch, self.config)
+                        if dop_batch is not None:
+                            with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
+                                dop_reference_output = self.model_setup.predict(
+                                    self.model, dop_batch, self.config, train_progress
+                                )
+                            dop_model_output = self.model_setup.predict(
+                                self.model, dop_batch, self.config, train_progress
+                            )
+                            dop_loss = dop_util.dop_loss(
+                                dop_model_output["predicted"],
+                                dop_reference_output["predicted"].to(dtype=dop_model_output["predicted"].dtype),
+                            )
+                            dop_weighted_loss = dop_loss * self.config.dop_multiplier
+                            cap_ratio = float(self.config.dop_max_weighted_to_base_ratio)
+                            if cap_ratio > 0:
+                                max_dop = cap_ratio * base_loss.detach()
+                                dop_weighted_loss = torch.minimum(dop_weighted_loss, max_dop)
+
+                    dop_replaced_n = 0.0
+                    if run_dop and dop_batch is not None:
+                        dop_replaced_n = float(dop_util.count_dop_trigger_replaced_samples(batch, self.config))
+                    dop_replaced_tensor = torch.tensor(dop_replaced_n, device=train_device, dtype=torch.float32)
+                    multi.reduce_tensor_sum(dop_replaced_tensor)
+                    accumulated_dop_trigger_replaced += dop_replaced_tensor
+
+                    loss = base_loss + dop_weighted_loss
 
                     loss = loss / self.config.gradient_accumulation_steps
                     if scaler:
@@ -755,6 +876,15 @@ class GenericTrainer(BaseTrainer):
                     detached_loss = loss.detach()
                     multi.reduce_tensor_mean(detached_loss)
                     accumulated_loss += detached_loss
+                    detached_base_loss = (base_loss / self.config.gradient_accumulation_steps).detach()
+                    detached_dop_loss = (dop_loss / self.config.gradient_accumulation_steps).detach()
+                    detached_dop_weighted_loss = (dop_weighted_loss / self.config.gradient_accumulation_steps).detach()
+                    multi.reduce_tensor_mean(detached_base_loss)
+                    multi.reduce_tensor_mean(detached_dop_loss)
+                    multi.reduce_tensor_mean(detached_dop_weighted_loss)
+                    accumulated_base_loss += detached_base_loss
+                    accumulated_dop_loss += detached_dop_loss
+                    accumulated_dop_weighted_loss += detached_dop_weighted_loss
 
                     if self.__is_update_step(train_progress):
                         if self.config.fused_gradient_reduce:
@@ -786,21 +916,75 @@ class GenericTrainer(BaseTrainer):
                             )
 
                             accumulated_loss_cpu = accumulated_loss.item()
+                            accumulated_base_loss_cpu = accumulated_base_loss.item()
+                            accumulated_dop_loss_cpu = accumulated_dop_loss.item()
+                            accumulated_dop_weighted_loss_cpu = accumulated_dop_weighted_loss.item()
+                            dop_base_ratio = (
+                                accumulated_dop_weighted_loss_cpu / accumulated_base_loss_cpu
+                                if accumulated_base_loss_cpu > 0
+                                else 0.0
+                            )
                             if math.isnan(accumulated_loss_cpu):
                                 raise RuntimeError("Training loss became NaN. This may be due to invalid parameters, precision issues, or a bug in the loss computation.")
 
-                            self.tensorboard.add_scalar("loss/train_step",accumulated_loss_cpu , train_progress.global_step)
+                            self.tensorboard.add_scalar("loss/train_step", accumulated_loss_cpu, train_progress.global_step)
+                            self.tensorboard.add_scalar("loss/train_base", accumulated_base_loss_cpu, train_progress.global_step)
+                            if self.config.dop_enabled:
+                                self.tensorboard.add_scalar("loss/train_dop", accumulated_dop_loss_cpu, train_progress.global_step)
+                                self.tensorboard.add_scalar("loss/train_dop_weighted", accumulated_dop_weighted_loss_cpu, train_progress.global_step)
+                                self.tensorboard.add_scalar("loss/train_dop_base_ratio", dop_base_ratio, train_progress.global_step)
+                                self.tensorboard.add_scalar(
+                                    "dop/policy_active",
+                                    1.0 if dop_util.should_run_dop(self.config, train_progress.global_step) else 0.0,
+                                    train_progress.global_step,
+                                )
+                                self.tensorboard.add_scalar("dop/effective_multiplier", self.config.dop_multiplier, train_progress.global_step)
+                                dop_replaced_cpu = accumulated_dop_trigger_replaced.item()
+                                self.tensorboard.add_scalar(
+                                    "dop/trigger_replaced_samples",
+                                    dop_replaced_cpu,
+                                    train_progress.global_step,
+                                )
+                                denom = (
+                                    float(self.config.batch_size)
+                                    * float(multi.world_size())
+                                    * float(self.config.gradient_accumulation_steps)
+                                )
+                                if denom > 0:
+                                    self.tensorboard.add_scalar(
+                                        "dop/trigger_replaced_sample_fraction",
+                                        dop_replaced_cpu / denom,
+                                        train_progress.global_step,
+                                    )
                             ema_loss = ema_loss or accumulated_loss_cpu
                             ema_loss_steps += 1
                             ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))
                             ema_loss = (ema_loss * ema_loss_decay) + (accumulated_loss_cpu * (1 - ema_loss_decay))
-                            step_tqdm.set_postfix({
+                            postfix_metrics = {
                                 'loss': accumulated_loss_cpu,
+                                'base': accumulated_base_loss_cpu,
                                 'smooth loss': ema_loss,
-                            })
+                            }
+                            if self.config.dop_enabled:
+                                postfix_metrics['dop'] = accumulated_dop_weighted_loss_cpu
+                                postfix_metrics['dop/base'] = dop_base_ratio
+                            step_tqdm.set_postfix(postfix_metrics)
                             self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss, train_progress.global_step)
+                            if (
+                                accumulated_base_loss_cpu > 0
+                                and accumulated_dop_weighted_loss_cpu > (2.0 * accumulated_base_loss_cpu)
+                                and float(self.config.dop_max_weighted_to_base_ratio) <= 0
+                            ):
+                                step_tqdm.write(
+                                    "Warning: DOP weighted loss is dominating base loss. Reduce dop_multiplier, "
+                                    "or set dop_max_weighted_to_base_ratio (e.g. 0.25–0.5) to cap preservation vs concept loss."
+                                )
 
-                        accumulated_loss = 0.0
+                        accumulated_loss = torch.tensor(0.0, device=train_device)
+                        accumulated_base_loss = torch.tensor(0.0, device=train_device)
+                        accumulated_dop_loss = torch.tensor(0.0, device=train_device)
+                        accumulated_dop_weighted_loss = torch.tensor(0.0, device=train_device)
+                        accumulated_dop_trigger_replaced = torch.tensor(0.0, device=train_device)
                         self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
 
                         if self.model.ema:
@@ -834,6 +1018,9 @@ class GenericTrainer(BaseTrainer):
                 return
 
     def end(self):
+        if self.sampler_pool is not None:
+            self.sampler_pool.shutdown()
+
         if self.one_step_trained:
             self.model.to(self.temp_device)
 

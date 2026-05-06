@@ -327,8 +327,14 @@ class LoRAModule(PeftBase):
         if isinstance(self.orig_module, BaseLinearSVD):
             return self.orig_module.forward_with_lora(x, self.lora_down, self.lora_up, self.dropout, self.alpha)
 
-        ld = self.lora_up(self.dropout(self.lora_down(x)))
-        return self.orig_forward(x) + ld * (self.alpha / self.rank)
+        # Keep LoRA matmul input dtype aligned with LoRA weights, then cast delta back
+        # to the base module output dtype before residual addition.
+        base = self.orig_forward(x)
+        lora_input = x if x.dtype == self.lora_down.weight.dtype else x.to(self.lora_down.weight.dtype)
+        ld = self.lora_up(self.dropout(self.lora_down(lora_input)))
+        if ld.dtype != base.dtype:
+            ld = ld.to(base.dtype)
+        return base + ld * (self.alpha / self.rank)
 
     def apply_to_module(self):
         # TODO
@@ -640,6 +646,12 @@ class LokrModule(PeftBase):
 
         in_m, in_n = factorization(in_dim, self.factor)
         out_l, out_k = factorization(out_dim, self.factor)
+        if min(in_m, in_n, out_l, out_k) <= 0:
+            raise ValueError(
+                "Invalid LoKr factorization. "
+                f"factor={self.factor} does not divide dimensions in={in_dim}, out={out_dim}. "
+                "Use -1 for automatic factorization or choose a divisor of both dimensions."
+            )
         
         # Consistent with Lycoris: w1 (l, m), w2 (k, n)
         # shape: ((out_l, out_k), (in_m, in_n))

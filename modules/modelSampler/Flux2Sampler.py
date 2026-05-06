@@ -112,7 +112,7 @@ class Flux2Sampler(BaseModelSampler):
             self.model.transformer_to(self.train_device)
             guidance = (torch.tensor([cfg_scale], device=self.train_device, dtype=self.model.train_dtype.torch_dtype())
                         if transformer.config.guidance_embeds else None)
-            for i, timestep in enumerate(tqdm(timesteps, desc="sampling")):
+            for i, timestep in enumerate(tqdm(timesteps, **self.tqdm_kw())):
                 latent_model_input = torch.cat([latent_image] * batch_size)
                 expanded_timestep = timestep.expand(latent_model_input.shape[0])
 

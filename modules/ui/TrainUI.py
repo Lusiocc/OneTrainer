@@ -20,6 +20,7 @@ from modules.ui.CaptionUI import CaptionUI
 from modules.ui.CloudTab import CloudTab
 from modules.ui.ConceptTab import ConceptTab
 from modules.ui.ConvertModelUI import ConvertModelUI
+from modules.ui.DOPTab import DOPTab
 from modules.ui.LoraTab import LoraTab
 from modules.ui.ModelTab import ModelTab
 from modules.ui.ProfilingWindow import ProfilingWindow
@@ -38,6 +39,7 @@ from modules.util.enum.ImageFormat import ImageFormat
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.PathIOType import PathIOType
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.memory_util import get_process_memory_snapshot, trim_process_working_set_windows
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 from modules.util.ui import components
@@ -121,6 +123,7 @@ class TrainUI(ctk.CTk):
         self.model_tab = None
         self.training_tab = None
         self.lora_tab = None
+        self.dop_tab = None
         self.cloud_tab = None
         self.additional_embeddings_tab = None
 
@@ -133,6 +136,7 @@ class TrainUI(ctk.CTk):
         self.training_commands = None
 
         self.always_on_tensorboard_subprocess = None
+        self._tensorboard_last_args = None
         self.current_workspace_dir = self.train_config.workspace_dir
         self._check_start_always_on_tensorboard()
 
@@ -289,55 +293,68 @@ class TrainUI(ctk.CTk):
                          tooltip="Port to use for Tensorboard link")
         components.entry(frame, 7, 3, self.ui_state, "tensorboard_port")
 
+        # RAM trim after training (Windows)
+        components.label(
+            frame,
+            8,
+            0,
+            "Trim RAM After Training",
+            tooltip="Windows: attempt to reduce Task Manager RAM usage after training ends. May slightly slow immediate restarts.",
+        )
+        components.switch(frame, 8, 1, self.ui_state, "trim_ram_after_training")
 
         # validation
-        components.label(frame, 8, 0, "Validation",
+        components.label(frame, 9, 0, "Validation",
                          tooltip="Enable validation steps and add new graph in tensorboard")
-        components.switch(frame, 8, 1, self.ui_state, "validation")
+        components.switch(frame, 9, 1, self.ui_state, "validation")
 
-        components.label(frame, 8, 2, "Validate after",
+        components.label(frame, 9, 2, "Validate after",
                          tooltip="The interval used when validate training")
-        components.time_entry(frame, 8, 3, self.ui_state, "validate_after", "validate_after_unit")
+        components.time_entry(frame, 9, 3, self.ui_state, "validate_after", "validate_after_unit")
 
         # device
-        components.label(frame, 10, 0, "Dataloader Threads",
+        components.label(frame, 11, 0, "Dataloader Threads",
                          tooltip="Number of threads used for the data loader. Increase if your GPU has room during caching, decrease if it's going out of memory during caching.")
-        components.entry(frame, 10, 1, self.ui_state, "dataloader_threads", required=True)
+        components.entry(frame, 11, 1, self.ui_state, "dataloader_threads", required=True)
 
-        components.label(frame, 11, 0, "Train Device",
+        components.label(frame, 12, 0, "Train Device",
                          tooltip="The device used for training. Can be \"cuda\", \"cuda:0\", \"cuda:1\" etc. Default:\"cuda\". Must be \"cuda\" for multi-GPU training.")
-        components.entry(frame, 11, 1, self.ui_state, "train_device", required=True)
+        components.entry(frame, 12, 1, self.ui_state, "train_device", required=True)
 
-        components.label(frame, 12, 0, "Multi-GPU",
+        components.label(frame, 13, 0, "Multi-GPU",
                          tooltip="Enable multi-GPU training")
-        components.switch(frame, 12, 1, self.ui_state, "multi_gpu")
-        components.label(frame, 12, 2, "Device Indexes",
+        components.switch(frame, 13, 1, self.ui_state, "multi_gpu")
+        components.label(frame, 13, 2, "Device Indexes",
                          tooltip="Multi-GPU: A comma-separated list of device indexes. If empty, all your GPUs are used. With a list such as \"0,1,3,4\" you can omit a GPU, for example an on-board graphics GPU.")
-        components.entry(frame, 12, 3, self.ui_state, "device_indexes")
+        components.entry(frame, 13, 3, self.ui_state, "device_indexes")
 
-        components.label(frame, 13, 0, "Gradient Reduce Precision",
+        components.label(frame, 14, 0, "Sampling Device Indexes",
+                         tooltip="Extra GPUs that participate in sampling while training on a single GPU. Comma-separated CUDA indexes (e.g. \"1,2\"). The train device GPU is always included. Leave empty to disable multi-GPU sampling.")
+        components.entry(frame, 14, 1, self.ui_state, "sample_device_indexes")
+
+        components.label(frame, 15, 0, "Gradient Reduce Precision",
                          tooltip="WEIGHT_DTYPE: Reduce gradients between GPUs in your weight data type; can be imprecise, but more efficient than float32\n"
                                  "WEIGHT_DTYPE_STOCHASTIC: Sum up the gradients in your weight data type, but average them in float32 and stochastically round if your weight data type is bfloat16\n"
                                  "FLOAT_32: Reduce gradients in float32\n"
                                  "FLOAT_32_STOCHASTIC: Reduce gradients in float32; use stochastic rounding to bfloat16 if your weight data type is bfloat16",
                          wide_tooltip=True)
-        components.options(frame, 13, 1, [str(x) for x in list(GradientReducePrecision)], self.ui_state,
+        components.options(frame, 15, 1, [str(x) for x in list(GradientReducePrecision)], self.ui_state,
                            "gradient_reduce_precision")
 
-        components.label(frame, 13, 2, "Fused Gradient Reduce",
+        components.label(frame, 15, 2, "Fused Gradient Reduce",
                          tooltip="Multi-GPU: Gradient synchronisation during the backward pass. Can be more efficient, especially with Async Gradient Reduce")
-        components.switch(frame, 13, 3, self.ui_state, "fused_gradient_reduce")
+        components.switch(frame, 15, 3, self.ui_state, "fused_gradient_reduce")
 
-        components.label(frame, 14, 0, "Async Gradient Reduce",
+        components.label(frame, 16, 0, "Async Gradient Reduce",
                          tooltip="Multi-GPU: Asynchroniously start the gradient reduce operations during the backward pass. Can be more efficient, but requires some VRAM.")
-        components.switch(frame, 14, 1, self.ui_state, "async_gradient_reduce")
-        components.label(frame, 14, 2, "Buffer size (MB)",
+        components.switch(frame, 16, 1, self.ui_state, "async_gradient_reduce")
+        components.label(frame, 16, 2, "Buffer size (MB)",
                          tooltip="Multi-GPU: Maximum VRAM for \"Async Gradient Reduce\", in megabytes. A multiple of this value can be needed if combined with \"Fused Back Pass\" and/or \"Layer offload fraction\"")
-        components.entry(frame, 14, 3, self.ui_state, "async_gradient_reduce_buffer")
+        components.entry(frame, 16, 3, self.ui_state, "async_gradient_reduce_buffer")
 
-        components.label(frame, 15, 0, "Temp Device",
+        components.label(frame, 17, 0, "Temp Device",
                          tooltip="The device used to temporarily offload models while they are not used. Default:\"cpu\"")
-        components.entry(frame, 15, 1, self.ui_state, "temp_device")
+        components.entry(frame, 17, 1, self.ui_state, "temp_device")
 
         frame.pack(fill="both", expand=1)
         return frame
@@ -408,7 +425,7 @@ class TrainUI(ctk.CTk):
 
         components.button(top_frame, 0, 6, "sample now", self.sample_now)
 
-        components.button(top_frame, 0, 7, "manual sample", self.open_sample_ui)
+        components.button(top_frame, 0, 7, "manual sample", self.open_manual_sample_window )
 
         components.label(sub_frame, 0, 0, "Non-EMA Sampling",
                          tooltip="Whether to include non-ema sampling when using ema.")
@@ -417,6 +434,27 @@ class TrainUI(ctk.CTk):
         components.label(sub_frame, 0, 2, "Samples to Tensorboard",
                          tooltip="Whether to include sample images in the Tensorboard output.")
         components.switch(sub_frame, 0, 3, self.ui_state, "samples_to_tensorboard")
+
+        if self.train_config.training_method == TrainingMethod.FINE_TUNE and (
+                self.train_config.model_type.is_stable_diffusion_xl()
+                or self.train_config.model_type.is_stable_diffusion()
+                or self.train_config.model_type.is_z_image()
+                or self.train_config.model_type.is_flux_1()
+                or self.train_config.model_type.is_flux_2()
+                or self.train_config.model_type.is_qwen()
+        ):
+            components.label(
+                sub_frame, 1, 0, "Sampler-only LoRA",
+                tooltip="Optional distillation or speed LoRA on the main denoiser, applied only during sampling "
+                        "(not in training loss). Accepts local paths, HF resolve/blob URLs, and repo ids (owner/repo). "
+                        "For LoRA training, configure this on the LoRA tab instead.",
+            )
+            components.path_entry(
+                sub_frame, 1, 1, self.ui_state, "sampler_lora_model_name",
+                mode="file", path_modifier=components.json_path_modifier,
+            )
+            components.label(sub_frame, 1, 2, "strength")
+            components.entry(sub_frame, 1, 3, self.ui_state, "sampler_lora_strength", width=72, sticky="nw")
 
         # table
         frame = ctk.CTkFrame(master=master, corner_radius=0)
@@ -570,6 +608,7 @@ class TrainUI(ctk.CTk):
 
         if self.lora_tab:
             self.lora_tab.refresh_ui()
+        self._refresh_dop_tab()
 
     def change_training_method(self, training_method: TrainingMethod):
         if not self.tabview:
@@ -581,13 +620,42 @@ class TrainUI(ctk.CTk):
         if training_method != TrainingMethod.LORA and "LoRA" in self.tabview._tab_dict:
             self.tabview.delete("LoRA")
             self.lora_tab = None
+        if "DOP" in self.tabview._tab_dict and not self._supports_dop_tab():
+            self.tabview.delete("DOP")
+            self.dop_tab = None
         if training_method != TrainingMethod.EMBEDDING and "embedding" in self.tabview._tab_dict:
             self.tabview.delete("embedding")
 
         if training_method == TrainingMethod.LORA and "LoRA" not in self.tabview._tab_dict:
             self.lora_tab = LoraTab(self.tabview.add("LoRA"), self.train_config, self.ui_state)
+        self._refresh_dop_tab()
         if training_method == TrainingMethod.EMBEDDING and "embedding" not in self.tabview._tab_dict:
             self.embedding_tab(self.tabview.add("embedding"))
+
+    def _supports_dop_tab(self) -> bool:
+        if self.train_config.training_method != TrainingMethod.LORA:
+            return False
+        mt = self.train_config.model_type
+        return (
+            mt.is_stable_diffusion_xl()
+            or mt.is_stable_diffusion()
+            or mt.is_z_image()
+            or mt.is_flux_1()
+            or mt.is_flux_2()
+            or mt.is_qwen()
+        )
+
+    def _refresh_dop_tab(self):
+        if not self.tabview:
+            return
+        if self._supports_dop_tab():
+            if "DOP" not in self.tabview._tab_dict:
+                self.dop_tab = DOPTab(self.tabview.add("DOP"), self.train_config, self.ui_state)
+            elif self.dop_tab:
+                self.dop_tab.refresh_ui()
+        elif "DOP" in self.tabview._tab_dict:
+            self.tabview.delete("DOP")
+            self.dop_tab = None
 
     def load_preset(self):
         if not self.tabview:
@@ -655,6 +723,7 @@ class TrainUI(ctk.CTk):
         if not self.training_callbacks and not self.training_commands:
             window = SampleWindow(
                 self,
+                use_external_model=False,
                 train_config=self.train_config,
             )
             self.wait_window(window)
@@ -685,13 +754,15 @@ class TrainUI(ctk.CTk):
             self.on_update_status(f"Error generating debug package: {e}")
 
 
-    def open_sample_ui(self):
+    def open_manual_sample_window (self):
         training_callbacks = self.training_callbacks
         training_commands = self.training_commands
 
         if training_callbacks and training_commands:
             window = SampleWindow(
                 self,
+                train_config=self.train_config,
+                use_external_model=True,
                 callbacks=training_callbacks,
                 commands=training_commands,
             )
@@ -708,6 +779,10 @@ class TrainUI(ctk.CTk):
 
         trainer = create.create_trainer(self.train_config, self.training_callbacks, self.training_commands, reattach=self.cloud_tab.reattach)
         try:
+            print(f"[memory] before start: {get_process_memory_snapshot().to_log_dict()}")
+        except Exception:
+            pass
+        try:
             trainer.start()
             if self.train_config.cloud.enabled:
                 self.ui_state.get_var("secrets.cloud").update(self.train_config.secrets.cloud)
@@ -720,6 +795,10 @@ class TrainUI(ctk.CTk):
             error_caught = True
             traceback.print_exc()
 
+        try:
+            print(f"[memory] before end: {get_process_memory_snapshot().to_log_dict()}")
+        except Exception:
+            pass
         trainer.end()
 
         # clear gpu memory
@@ -729,6 +808,19 @@ class TrainUI(ctk.CTk):
         self.training_commands = None
         torch.clear_autocast_cache()
         torch_gc()
+
+        try:
+            print(f"[memory] after torch_gc: {get_process_memory_snapshot().to_log_dict()}")
+        except Exception:
+            pass
+
+        if getattr(self.train_config, "trim_ram_after_training", False):
+            try:
+                ok = trim_process_working_set_windows()
+                print(f"[memory] working_set_trim_ok={ok}")
+                print(f"[memory] after trim: {get_process_memory_snapshot().to_log_dict()}")
+            except Exception:
+                pass
 
         if error_caught:
             self.on_update_status("Error: check the console for details")
@@ -808,16 +900,19 @@ class TrainUI(ctk.CTk):
             self._start_always_on_tensorboard()
 
     def _start_always_on_tensorboard(self):
-        if self.always_on_tensorboard_subprocess:
-            self._stop_always_on_tensorboard()
+        if self.always_on_tensorboard_subprocess is not None:
+            if self.always_on_tensorboard_subprocess.poll() is None:
+                return
+            self.always_on_tensorboard_subprocess = None
 
-        tensorboard_executable = os.path.join(os.path.dirname(sys.executable), "tensorboard")
         tensorboard_log_dir = os.path.join(self.train_config.workspace_dir, "tensorboard")
 
         os.makedirs(Path(tensorboard_log_dir).absolute(), exist_ok=True)
 
         tensorboard_args = [
-            tensorboard_executable,
+            sys.executable,
+            "-m",
+            "tensorboard.main",
             "--logdir",
             tensorboard_log_dir,
             "--port",
@@ -828,8 +923,12 @@ class TrainUI(ctk.CTk):
         if self.train_config.tensorboard_expose:
             tensorboard_args.append("--bind_all")
 
+        if self._tensorboard_last_args == tensorboard_args:
+            return
+
         try:
             self.always_on_tensorboard_subprocess = subprocess.Popen(tensorboard_args)
+            self._tensorboard_last_args = tensorboard_args
         except Exception:
             self.always_on_tensorboard_subprocess = None
 
@@ -844,6 +943,7 @@ class TrainUI(ctk.CTk):
                 pass
             finally:
                 self.always_on_tensorboard_subprocess = None
+                self._tensorboard_last_args = None
 
     def _on_workspace_dir_change(self, new_workspace_dir: str):
         if new_workspace_dir != self.current_workspace_dir:

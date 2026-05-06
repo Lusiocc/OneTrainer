@@ -1,4 +1,5 @@
 from modules.util.config.SampleConfig import SampleConfig
+from modules.util.enum.ModelType import ModelType
 from modules.util.enum.NoiseScheduler import NoiseScheduler
 from modules.util.ui import components
 from modules.util.ui.UIState import UIState
@@ -12,6 +13,7 @@ class SampleFrame(ctk.CTkFrame):
             parent,
             sample: SampleConfig,
             ui_state: UIState,
+            model_type: ModelType,
             include_prompt: bool = True,
             include_settings: bool = True,
     ):
@@ -19,6 +21,11 @@ class SampleFrame(ctk.CTkFrame):
 
         self.sample = sample
         self.ui_state = ui_state
+        self.model_type = model_type
+
+        is_flow_matching = model_type.is_flow_matching()
+        is_inpainting_model = model_type.has_conditioning_image_input()
+        is_video_model = model_type.is_video_model()
 
         if include_prompt and include_prompt:
             self.grid_rowconfigure(0, weight=0)
@@ -59,15 +66,16 @@ class SampleFrame(ctk.CTkFrame):
             components.label(bottom_frame, 0, 2, "height:")
             components.entry(bottom_frame, 0, 3, self.ui_state, "height")
 
-            # frames
-            components.label(bottom_frame, 1, 0, "frames:",
-                             tooltip="Number of frames to generate. Only used when generating videos.")
-            components.entry(bottom_frame, 1, 1, self.ui_state, "frames")
+            if is_video_model:
+                # frames
+                components.label(bottom_frame, 1, 0, "frames:",
+                                tooltip="Number of frames to generate. Only used when generating videos.")
+                components.entry(bottom_frame, 1, 1, self.ui_state, "frames")
 
-            # length
-            components.label(bottom_frame, 1, 2, "length:",
-                             tooltip="Length in seconds of audio output.")
-            components.entry(bottom_frame, 1, 3, self.ui_state, "length")
+                # length
+                components.label(bottom_frame, 1, 2, "length:",
+                                tooltip="Length in seconds of audio output.")
+                components.entry(bottom_frame, 1, 3, self.ui_state, "length")
 
             # seed
             components.label(bottom_frame, 2, 0, "seed:")
@@ -82,53 +90,86 @@ class SampleFrame(ctk.CTkFrame):
             components.entry(bottom_frame, 3, 1, self.ui_state, "cfg_scale")
 
             # sampler
-            components.label(bottom_frame, 4, 2, "sampler:")
-            components.options_kv(bottom_frame, 4, 3, [
-                ("DDIM", NoiseScheduler.DDIM),
-                ("Euler", NoiseScheduler.EULER),
-                ("Euler A", NoiseScheduler.EULER_A),
-                # ("DPM++", NoiseScheduler.DPMPP), # TODO: produces noisy samples
-                # ("DPM++ SDE", NoiseScheduler.DPMPP_SDE), # TODO: produces noisy samples
-                ("UniPC", NoiseScheduler.UNIPC),
-                ("Euler Karras", NoiseScheduler.EULER_KARRAS),
-                ("DPM++ Karras", NoiseScheduler.DPMPP_KARRAS),
-                ("DPM++ SDE Karras", NoiseScheduler.DPMPP_SDE_KARRAS),
-                # ("UniPC Karras", NoiseScheduler.UNIPC_KARRAS),# TODO: update diffusers to fix UNIPC_KARRAS (see https://github.com/huggingface/diffusers/pull/4581)
-            ], self.ui_state, "noise_scheduler")
+            if not is_flow_matching:
+                components.label(bottom_frame, 4, 2, "sampler:")
+                components.options_kv(bottom_frame, 4, 3, [
+                    ("DDIM", NoiseScheduler.DDIM),
+                    ("LCM", NoiseScheduler.LCM),
+                    ("Euler", NoiseScheduler.EULER),
+                    ("Euler A", NoiseScheduler.EULER_A),
+                    # ("DPM++", NoiseScheduler.DPMPP), # TODO: produces noisy samples
+                    # ("DPM++ SDE", NoiseScheduler.DPMPP_SDE), # TODO: produces noisy samples
+                    ("UniPC", NoiseScheduler.UNIPC),
+                    ("Euler Karras", NoiseScheduler.EULER_KARRAS),
+                    ("DPM++ Karras", NoiseScheduler.DPMPP_KARRAS),
+                    ("DPM++ SDE Karras", NoiseScheduler.DPMPP_SDE_KARRAS),
+                    # ("UniPC Karras", NoiseScheduler.UNIPC_KARRAS),# TODO: update diffusers to fix UNIPC_KARRAS (see https://github.com/huggingface/diffusers/pull/4581)
+                ], self.ui_state, "noise_scheduler")
 
             # steps
             components.label(bottom_frame, 4, 0, "steps:")
             components.entry(bottom_frame, 4, 1, self.ui_state, "diffusion_steps")
 
             # inpainting
-            components.label(bottom_frame, 5, 0, "inpainting:",
-                             tooltip="Enables inpainting sampling. Only available when sampling from an inpainting model.")
-            components.switch(bottom_frame, 5, 1, self.ui_state, "sample_inpainting")
+            if is_inpainting_model:
+                components.label(bottom_frame, 5, 0, "inpainting:",
+                                tooltip="Enables inpainting sampling. Only available when sampling from an inpainting model.")
+                components.switch(bottom_frame, 5, 1, self.ui_state, "sample_inpainting")
 
-            # base image path
-            components.label(bottom_frame, 6, 0, "base image path:",
-                             tooltip="The base image used when inpainting.")
-            components.path_entry(bottom_frame, 6, 1, self.ui_state, "base_image_path",
-                                  mode="file", allow_model_files=False,
-                                  allow_image_files=True,
-                                  )
+                # base image path
+                components.label(bottom_frame, 6, 0, "base image path:",
+                                tooltip="The base image used when inpainting.")
+                components.file_entry(bottom_frame, 6, 1, self.ui_state, "base_image_path",
+                                    mode="file",
+                                    allow_model_files=False,
+                                    allow_image_files=True,
+                                    )
 
-            # mask image path
-            components.label(bottom_frame, 6, 2, "mask image path:",
-                             tooltip="The mask used when inpainting.")
-            components.path_entry(bottom_frame, 6, 3, self.ui_state, "mask_image_path",
-                                  mode="file", allow_model_files=False,
-                                  allow_image_files=True,
-                                  )
+                # mask image path
+                components.label(bottom_frame, 6, 2, "mask image path:",
+                                tooltip="The mask used when inpainting.")
+                components.file_entry(bottom_frame, 6, 3, self.ui_state, "mask_image_path",
+                                    mode="file",
+                                    allow_model_files=False,
+                                    allow_image_files=True,
+                                    )
+
+            components.label(
+                bottom_frame, 7, 0, "custom timesteps:",
+                tooltip="Optional comma-separated indices (e.g. DMD2 SDXL: 999,749,499,249). "
+                        "Requires LCM or Euler; leave empty to use the step count only.",
+            )
+            components.entry(
+                bottom_frame, 7, 1, self.ui_state, "custom_diffusion_timesteps",
+                width=220, sticky="ew",
+            )
+
+            components.label(
+                bottom_frame, 8, 0, "sampler LoRA:",
+                tooltip="Inference-only LoRA on the main denoiser during sampling (e.g. DMD2 / Lightning on SD; "
+                        "transformer LoRA on Z-Image, Flux, Qwen). Accepts local paths, HF resolve/blob URLs, and "
+                        "repo ids (owner/repo). Stacks on the trained adapter. Leave empty to disable.",
+            )
+            components.path_entry(
+                bottom_frame, 8, 1, self.ui_state, "sampler_lora_model_name",
+                mode="file", path_modifier=components.json_path_modifier,
+            )
+
+            components.label(
+                bottom_frame, 9, 0, "sampler LoRA strength:",
+                tooltip="If left as 1.0, falls back to the train/LoRA-tab sampler LoRA strength. "
+                        "Set to any other value for a per-sample override.",
+            )
+            components.entry(bottom_frame, 9, 1, self.ui_state, "sampler_lora_strength")
 
             # MeanCache acceleration
-            components.label(bottom_frame, 7, 0, "MeanCache:",
+            components.label(bottom_frame, 10, 0, "MeanCache:",
                              tooltip="Enable MeanCache for ~1.4x-2.0x sampling speedup (Flow Matching models only)")
-            components.switch(bottom_frame, 7, 1, self.ui_state, "use_meancache")
+            components.switch(bottom_frame, 10, 1, self.ui_state, "use_meancache")
 
             # MeanCache preset
-            components.label(bottom_frame, 7, 2, "Preset:",
+            components.label(bottom_frame, 10, 2, "Preset:",
                              tooltip="Quality (1.4x) / Balanced (1.67x) / Speed (1.8x) / Turbo (2.0x)")
-            components.options(bottom_frame, 7, 3, ["quality", "balanced", "speed", "turbo"], 
+            components.options(bottom_frame, 10, 3, ["quality", "balanced", "speed", "turbo"],
                              self.ui_state, "meancache_preset")
 

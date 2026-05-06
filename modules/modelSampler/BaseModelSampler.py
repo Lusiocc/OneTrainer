@@ -1,5 +1,6 @@
 import io
 import os
+import threading
 from abc import ABCMeta, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
@@ -11,8 +12,8 @@ from modules.util.enum.ImageFormat import ImageFormat
 from modules.util.enum.VideoFormat import VideoFormat
 
 import torch
-from torchvision.io import write_video
 
+import av
 from PIL import Image
 
 
@@ -60,6 +61,17 @@ class BaseModelSampler(metaclass=ABCMeta):
         self.train_device = train_device
         self.temp_device = temp_device
 
+    def tqdm_kw(self, desc: str = "sampling") -> dict:
+        """Extra kwargs for tqdm when running inside `SamplerPool` worker threads."""
+        tls = threading.current_thread()
+        wi = getattr(tls, "_sampler_tqdm_worker_idx", None)
+        if wi is None:
+            return {"desc": desc}
+        di = getattr(tls, "_sampler_tqdm_device_index", None)
+        di_str = str(di) if di is not None else "?"
+        # Keep completed bars in logs to match previous sampling output behavior.
+        return {"position": int(wi), "leave": True, "desc": f"GPU{di_str} {desc}"}
+
     @abstractmethod
     def sample(
             self,
@@ -84,6 +96,7 @@ class BaseModelSampler(metaclass=ABCMeta):
             image_format: ImageFormat | None,
             video_format: VideoFormat | None,
             audio_format: AudioFormat | None,
+            fps: int = 24,
     ):
         os.makedirs(Path(destination).parent.absolute(), exist_ok=True)
 
@@ -95,6 +108,36 @@ class BaseModelSampler(metaclass=ABCMeta):
         elif sampler_output.file_type == FileType.VIDEO:
             if video_format is None:
                 raise ValueError("Video format required for sampling a video")
-            write_video(destination + video_format.extension(), options={"crf": "17"}, video_array=sampler_output.data, fps=24)
+
+            if isinstance(sampler_output.data, torch.Tensor):
+                video_tensor = sampler_output.data.detach().cpu()
+
+                if len(video_tensor.shape) == 4:
+                    shape = video_tensor.shape
+                    # (T, H, W, C) if last dim is channels, otherwise assume (C, T, H, W)
+                    frames = video_tensor.numpy() if shape[-1] == 3 else video_tensor.permute(1, 2, 3, 0).numpy()
+
+                    frames = (
+                        (frames * 255).astype('uint8')
+                        if frames.max() <= 1.0
+                        else frames.astype('uint8')
+                    )
+
+                    with av.open(destination + video_format.extension(), 'w') as container:
+                        stream = container.add_stream('libx264', rate=fps)
+                        stream.options = {'crf': '17'}
+                        stream.width = frames.shape[2]
+                        stream.height = frames.shape[1]
+                        stream.pix_fmt = 'yuv420p'  # Required pixel format for H.264
+
+                        for frame_data in frames:
+                            frame = av.VideoFrame.from_ndarray(frame_data, format='rgb24')
+                            for packet in stream.encode(frame):
+                                container.mux(packet)
+
+                        for packet in stream.encode():
+                            container.mux(packet)
+                else:
+                    raise ValueError(f"Expected 4D video tensor (T, H, W, C) or (C, T, H, W), got shape {video_tensor.shape}")
         elif sampler_output.file_type == FileType.AUDIO:
             pass # TODO
