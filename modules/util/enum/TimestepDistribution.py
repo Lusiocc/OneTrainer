@@ -9,6 +9,7 @@ class TimestepDistribution(Enum):
     COS_MAP = 'COS_MAP'
     INVERTED_PARABOLA = 'INVERTED_PARABOLA'
     NEG_SQUARE = 'NEG_SQUARE'  # -x² distribution for balanced high/low noise training
+    BETA = 'BETA'
 
     def __str__(self):
         return self.value

@@ -38,17 +38,17 @@ class LoraTab:
         components.options_kv(self.scroll_frame, 0, 1, [
             ("LoRA", PeftType.LORA),
             ("LoHa", PeftType.LOHA),
-            ("LoKr", PeftType.LOKR),
             ("OFT v2", PeftType.OFT_2),
+            ("LoKr", PeftType.LOKR),
         ], self.ui_state, "peft_type", command=self.setup_lora)
 
     def setup_lora(self, peft_type: PeftType):
         if peft_type == PeftType.LOHA:
             name = "LoHa"
-        elif peft_type == PeftType.LOKR:
-            name = "LoKr"
         elif peft_type == PeftType.OFT_2:
             name = "OFT v2"
+        elif peft_type == PeftType.LOKR:
+            name = "LoKr"
         else:
             name = "LoRA"
 
@@ -87,8 +87,8 @@ class LoraTab:
                              tooltip="Apply the weight decomposition on the output axis instead of the input axis.")
             components.switch(master, 3, 4, self.ui_state, "lora_decompose_output_axis")
 
-        # LoRA, LoHA, LoKr shared settings
-        if peft_type in [PeftType.LORA, PeftType.LOHA, PeftType.LOKR]:
+        # LoRA and LoHA shared settings
+        if peft_type == PeftType.LORA or peft_type == PeftType.LOHA:
             # rank
             components.label(master, 1, 0, f"{name} rank",
                             tooltip=f"The rank parameter used when creating a new {name}")
@@ -116,12 +116,6 @@ class LoraTab:
             components.label(master, 5, 0, "Bundle Embeddings",
                             tooltip=f"Bundles any additional embeddings into the {name} output file, rather than as separate files")
             components.switch(master, 5, 1, self.ui_state, "bundle_additional_embeddings")
-            
-            # LoKr specific
-            if peft_type == PeftType.LOKR:
-                 components.label(master, 1, 3, "Factor",
-                                 tooltip="LoKr Factor. -1 for automatic.")
-                 components.entry(master, 1, 4, self.ui_state, "lokr_factor")
 
         # OFTv2
         elif peft_type == PeftType.OFT_2:
@@ -139,9 +133,14 @@ class LoraTab:
             components.entry(master, 2, 4, self.ui_state, "coft_eps")
 
             # Block Share
-            components.label(master, 3, 3, "Block Share",
+            components.label(master, 1, 3, "Block Share",
                              tooltip="Share the OFT parameters between blocks. A single rotation matrix is shared across all blocks within a layer, drastically cutting the number of trainable parameters and yielding very compact adapter files, potentially improving generalization but at the cost of significant expressiveness, which can lead to underfitting on more complex or diverse tasks.")
-            components.switch(master, 3, 4, self.ui_state, "oft_block_share")
+            components.switch(master, 1, 4, self.ui_state, "oft_block_share")
+
+            # Scaled OFT (SOFT)
+            components.label(master, 2, 3, "Scaled OFT (SOFT)",
+                             tooltip="Applies a scaling factor to the learned weights. This ensures that the effective learning rate remains consistent across different block sizes. Without this, different block sizes require significantly different learning rates.")
+            components.switch(master, 2, 4, self.ui_state, "oft_scaled")
 
             # Dropout Percentage
             components.label(master, 2, 0, "Dropout Probability",
@@ -160,6 +159,68 @@ class LoraTab:
             components.label(master, 4, 0, "Bundle Embeddings",
                             tooltip=f"Bundles any additional embeddings into the {name} output file, rather than as separate files")
             components.switch(master, 4, 1, self.ui_state, "bundle_additional_embeddings")
+
+        # LoKr
+        elif peft_type == PeftType.LOKR:
+            # LoKr Main Settings
+            components.label(master, 1, 0, f"{name} dimension",
+                             tooltip="The dimension parameter used for the secondary decomposition. Analogous to rank in LoRA.")
+            components.entry(master, 1, 1, self.ui_state, "lokr_dim")
+
+            components.label(master, 2, 0, "Decomposition Factor",
+                             tooltip="Factor for Kronecker product decomposition. -1 for auto, which is recommended. Changing this drastically affects parameter count.")
+            components.entry(master, 2, 1, self.ui_state, "lokr_decompose_factor")
+
+            # alpha
+            components.label(master, 3, 0, f"{name} alpha",
+                            tooltip=f"The alpha parameter used when creating a new {name}")
+            components.entry(master, 3, 1, self.ui_state, "lora_alpha")
+
+            # Dropout Percentage
+            components.label(master, 4, 0, "Dropout Probability",
+                            tooltip="Dropout probability. This percentage of model nodes will be randomly ignored at each training step. Helps with overfitting. 0 disables, 1 maximum.")
+            components.entry(master, 4, 1, self.ui_state, "dropout_probability")
+
+            # LoKr weight dtype
+            components.label(master, 5, 0, f"{name} Weight Data Type",
+                            tooltip=f"The {name} weight data type used for training. This can reduce memory consumption, but reduces precision")
+            components.options_kv(master, 5, 1, [
+                ("float32", DataType.FLOAT_32),
+                ("bfloat16", DataType.BFLOAT_16),
+            ], self.ui_state, "lora_weight_dtype")
+
+            # LoKr Vectorization trick
+            components.label(master, 6, 0, "Kronecker-Vec Trick",
+                             tooltip="Uses an accelerated path that bypasses the materialization of the full Kronecker product. This delivers a massive speedup to the LoKr without sacrificing precision. Highly recommended.")
+            components.switch(master, 6, 1, self.ui_state, "lokr_vec_trick")
+
+            #LoKr Decomposition Settings
+            components.label(master, 1, 3, "Decompose Both Matrices",
+                             tooltip="Perform rank decomposition on both Kronecker product matrices (W1 and W2). Only effective for very small dimensions.")
+            components.switch(master, 1, 4, self.ui_state, "lokr_decompose_both")
+
+            components.label(master, 2, 3, "Use Tucker Decomposition (Conv)",
+                             tooltip="Use Tucker decomposition for convolutional layers. Can be more efficient for some architectures.")
+            components.switch(master, 2, 4, self.ui_state, "lokr_use_tucker")
+
+            components.label(master, 3, 3, "Force Full Matrix (W2)",
+                             tooltip="Forces the second Kronecker matrix (W2) to be a full matrix, ignoring the dimension setting. For expert use.")
+            components.switch(master, 3, 4, self.ui_state, "lokr_full_matrix")
+
+            # LoKr DoRA Settings
+            components.label(master, 4, 3, "Decompose Weights (DoRA)",
+                             tooltip="Apply weight decomposition (DoRA) on top of the LoKr update.")
+            components.switch(master, 4, 4, self.ui_state, "lokr_weight_decompose")
+
+            components.label(master, 5, 3, "Apply DoRA on Output Axis",
+                             tooltip="Apply the DoRA weight decomposition on the output axis instead of the input axis.")
+            components.switch(master, 5, 4, self.ui_state, "lokr_dora_on_output")
+
+
+            # Additional embeddings
+            components.label(master, 6, 3, "Bundle Embeddings",
+                            tooltip=f"Bundles any additional embeddings into the {name} output file, rather than as separate files")
+            components.switch(master, 6, 4, self.ui_state, "bundle_additional_embeddings")
 
         if peft_type == PeftType.LORA and (
                 self.train_config.model_type.is_stable_diffusion_xl()

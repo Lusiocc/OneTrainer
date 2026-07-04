@@ -588,14 +588,20 @@ class TrainConfig(BaseConfig):
     # If > 0, weighted DOP loss is capped at (this * base_loss) per step so preservation cannot extinguish concept learning.
     dop_max_weighted_to_base_ratio: float
 
-    # lokr
-    lokr_factor: int
-
     # oft
     oft_block_size: int
-    oft_coft: bool
-    coft_eps: float
     oft_block_share: bool
+    oft_scaled: bool
+
+    # lokr
+    lokr_dim: int
+    lokr_decompose_both: bool
+    lokr_decompose_factor: int
+    lokr_use_tucker: bool
+    lokr_weight_decompose: bool
+    lokr_dora_on_output: bool
+    lokr_full_matrix: bool
+    lokr_vec_trick: bool
 
     # optimizer
     optimizer: TrainOptimizerConfig
@@ -1252,14 +1258,20 @@ class TrainConfig(BaseConfig):
         data.append(("dop_allow_missing_trigger", False, bool, False))
         data.append(("dop_max_weighted_to_base_ratio", 0.0, float, False))
 
-        # lokr
-        data.append(("lokr_factor", -1, int, False))
-
         # oft
         data.append(("oft_block_size", 32, int, False))
-        data.append(("oft_coft", False, bool, False))
-        data.append(("coft_eps", 1e-4, float, False))
         data.append(("oft_block_share", False, bool, False))
+        data.append(("oft_scaled", False, bool, False))
+
+        # lokr
+        data.append(("lokr_dim", 16, int, False))
+        data.append(("lokr_decompose_both", False, bool, False))
+        data.append(("lokr_decompose_factor", -1, int, False))
+        data.append(("lokr_use_tucker", False, bool, False))
+        data.append(("lokr_weight_decompose", False, bool, False))
+        data.append(("lokr_dora_on_output", True, bool, False))
+        data.append(("lokr_full_matrix", False, bool, False))
+        data.append(("lokr_vec_trick", True, bool, False))
 
         # optimizer
         data.append(("optimizer", TrainOptimizerConfig.default_values(), TrainOptimizerConfig, False))

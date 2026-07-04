@@ -23,6 +23,7 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 
+@factory.register(BaseModelSampler, ModelType.Z_IMAGE)
 class ZImageSampler(BaseModelSampler):
     def __init__(
             self,
@@ -190,5 +191,3 @@ class ZImageSampler(BaseModelSampler):
         )
 
         on_sample(sampler_output)
-
-factory.register(BaseModelSampler, ZImageSampler, ModelType.Z_IMAGE)
