@@ -21,6 +21,7 @@ class Optimizer(Enum):
 
     AdEMAMix = 'AdEMAMix'
     AdEMAMix_8BIT = "AdEMAMix_8BIT"
+    SIMPLIFIED_AdEMAMix = 'SIMPLIFIED_AdEMAMix'
 
     ADOPT = 'ADOPT'
     ADOPT_ADV = 'ADOPT_ADV'
@@ -34,6 +35,7 @@ class Optimizer(Enum):
     LION = 'LION'
     LION_8BIT = 'LION_8BIT'
     LION_ADV = 'LION_ADV'
+    LION_PRODIGY_ADV = 'LION_PRODIGY_ADV'
 
     RMSPROP = 'RMSPROP'
     RMSPROP_8BIT = 'RMSPROP_8BIT'
